@@ -1,0 +1,19 @@
+{
+  "name": "loomtrace-functions",
+  "version": "0.1.0",
+  "private": true,
+  "engines": { "node": "20" },
+  "main": "lib/index.js",
+  "scripts": {
+    "build": "tsc",
+    "serve": "npm run build && firebase emulators:start --only functions",
+    "deploy": "npm run build && firebase deploy --only functions"
+  },
+  "dependencies": {
+    "firebase-admin": "13.0.1",
+    "firebase-functions": "6.1.0"
+  },
+  "devDependencies": {
+    "typescript": "5.6.3"
+  }
+}

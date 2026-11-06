@@ -1,0 +1,185 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helpers ──────────────────────────────────────────────────────
+    // Role source of truth is the custom claim, NEVER a Firestore field
+    // (see Phase 1 Rev 2 §8 and lib/firebase/admin.ts). Any rule that
+    // checked resource.data.role instead of this would be trivially
+    // bypassable by a client editing its own document.
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function role() {
+      return isSignedIn() ? request.auth.token.role : null;
+    }
+
+    function isRole(r) {
+      return role() == r;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isRole('admin');
+    }
+
+    function isGovernment() {
+      return isRole('government') || isAdmin();
+    }
+
+    // ── users ────────────────────────────────────────────────────────
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isAdmin() || isGovernment();
+      // Client-side create allowed only for the user's own doc, and only
+      // with fields the registration flow actually sets — 'role' is
+      // intentionally NOT writable here (see set-role/route.ts; only the
+      // Admin SDK, via server code, ever sets the authoritative role).
+      allow create: if isOwner(userId)
+                    && !('role' in request.resource.data);
+      allow update: if isOwner(userId)
+                    && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'status']);
+      allow delete: if false; // accounts are deactivated (status field), never hard-deleted
+    }
+
+    // ── weaverIdentities (Phase 1 Rev 3 §7) ─────────────────────────────
+    match /weaverIdentities/{weaverId} {
+      allow read: if true; // public professional profiles — part of trust-building
+      allow create: if isRole('weaver') && isOwner(weaverId);
+      allow update: if (isOwner(weaverId) || isAdmin() || isGovernment())
+                    // Verification status can only ever be changed by
+                    // government/admin, never by the weaver themselves.
+                    && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['verificationStatus'])
+                        || isGovernment());
+      allow delete: if false;
+
+      match /identityEvents/{eventId} {
+        allow read: if true;
+        // Append-only: create permitted, update/delete never — this is
+        // what makes the lifecycle an actual audit trail rather than an
+        // editable log (Phase 1 Rev 2 §8).
+        allow create: if isSignedIn(); // further constrained server-side by event 'type' rules
+        allow update, delete: if false;
+      }
+    }
+
+    // ── products ─────────────────────────────────────────────────────
+    match /products/{productId} {
+      allow read: if resource.data.status == 'published' || isOwner(resource.data.weaverId) || isAdmin();
+      allow create: if isRole('weaver') && request.resource.data.weaverId == request.auth.uid;
+      allow update, delete: if isOwner(resource.data.weaverId) || isAdmin();
+    }
+
+    // ── productIdentities (DPI, Phase 1 Rev 2 §2) ───────────────────────
+    match /productIdentities/{dpiId} {
+      // Publicly readable — this is the entire point of QR verification
+      // working without login.
+      allow read: if true;
+      allow create: if isRole('weaver');
+      // Only non-authority fields are client-updatable; verification/
+      // recognition fields require government role. Enforced fully in
+      // the Route Handler (defense-in-depth layer 2); this rule is the
+      // last-line backstop.
+      allow update: if (isOwner(resource.data.weaverId) || isGovernment())
+                    && (!request.resource.data.diff(resource.data).affectedKeys()
+                          .hasAny(['verification', 'recognitions']) || isGovernment());
+      allow delete: if false;
+
+      match /lifecycleEvents/{eventId} {
+        allow read: if true;
+        allow create: if isSignedIn();
+        allow update, delete: if false; // immutability guarantee, see Rev 2 §8
+      }
+    }
+
+    // ── orders ───────────────────────────────────────────────────────
+    match /orders/{orderId} {
+      allow read: if isOwner(resource.data.buyerId) || isOwner(resource.data.weaverId) || isAdmin();
+      allow create: if isRole('buyer') && request.resource.data.buyerId == request.auth.uid;
+      allow update: if isOwner(resource.data.buyerId) || isOwner(resource.data.weaverId) || isAdmin();
+      allow delete: if false;
+    }
+
+    // ── reviews ──────────────────────────────────────────────────────
+    match /reviews/{reviewId} {
+      allow read: if true;
+      allow create: if isRole('buyer') && request.resource.data.buyerId == request.auth.uid;
+      allow update, delete: if isOwner(resource.data.buyerId) || isAdmin();
+    }
+
+    // ── notifications ────────────────────────────────────────────────
+    match /notifications/{notificationId} {
+      allow read, update: if isOwner(resource.data.userId);
+      allow create: if false; // server-only, via Cloud Functions
+      allow delete: if isOwner(resource.data.userId);
+    }
+
+    // ── qrScans ──────────────────────────────────────────────────────
+    match /qrScans/{scanId} {
+      allow read: if isGovernment();
+      allow create: if true; // anonymous scans are the whole point of public verification
+      allow update, delete: if false;
+    }
+
+    // ── clusters ─────────────────────────────────────────────────────
+    match /clusters/{clusterId} {
+      allow read: if true;
+      allow write: if isGovernment();
+    }
+
+    // ── analyticsRollups / impactMetrics / scanAggregates ───────────────
+    // Server-computed only (Cloud Functions), read access scoped to
+    // officials — this is exactly the "no live fan-out queries" pattern
+    // from Phase 1 Rev 2/3, enforced at the rules layer too.
+    match /{collection}/{docId} {
+      allow read: if isGovernment()
+                  && collection in ['analyticsRollups', 'impactMetrics', 'scanAggregates', 'interventionAlerts'];
+      allow write: if false;
+    }
+
+    // ── marketInsights ───────────────────────────────────────────────
+    match /marketInsights/{insightId} {
+      allow read: if isSignedIn();
+      allow write: if false; // server-only (Gemini + rollup pipeline)
+    }
+
+    // ── heritageEntries (Phase 1 Rev 3 §8) ──────────────────────────────
+    match /heritageEntries/{entryId} {
+      allow read: if true; // public good content, no login required
+      allow write: if isGovernment(); // publish requires human sign-off per Rev 3 §8
+    }
+
+    // ── exportProfiles ───────────────────────────────────────────────
+    match /exportProfiles/{weaverId} {
+      allow read: if isOwner(weaverId) || isGovernment();
+      allow write: if isOwner(weaverId) || isAdmin();
+    }
+
+    // ── aiDecisions (Responsible AI audit trail, Phase 1 Rev 3 §5) ──────
+    match /aiDecisions/{decisionId} {
+      allow read: if isGovernment() || isOwner(resource.data.subjectUserId);
+      allow write: if false; // server-only
+    }
+
+    // ── auditLogs ────────────────────────────────────────────────────
+    match /auditLogs/{logId} {
+      allow read: if isAdmin();
+      allow write: if false; // server-only, Admin SDK bypasses rules by design
+    }
+
+    // ── schemes (roadmap collection — rules present, feature not yet built) ──
+    match /schemes/{schemeId} {
+      allow read: if true;
+      allow write: if isGovernment();
+    }
+
+    // Default-deny: anything not explicitly matched above is inaccessible.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

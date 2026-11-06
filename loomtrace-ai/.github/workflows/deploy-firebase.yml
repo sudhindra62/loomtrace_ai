@@ -1,0 +1,36 @@
+name: Deploy Firebase Backend
+
+# Vercel deploys the Next.js app itself via its own GitHub integration
+# (connect the repo in the Vercel dashboard — no token needed here).
+# This workflow handles the parts Vercel doesn't: Firestore/Storage rules,
+# indexes, and Cloud Functions, which must be deployed to the Firebase
+# project directly.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "firestore.rules"
+      - "firestore.indexes.json"
+      - "storage.rules"
+      - "functions/**"
+
+jobs:
+  deploy-firebase:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: functions/package.json
+      - run: npm ci --prefix functions
+      - run: npm run build --prefix functions
+      - uses: w9jds/firebase-action@v13.7.0
+        with:
+          args: deploy --only firestore:rules,firestore:indexes,storage:rules,functions
+        env:
+          # Generated via `firebase login:ci`, stored as a repo secret —
+          # never committed, never logged.
+          FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
+          PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}

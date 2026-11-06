@@ -1,0 +1,57 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidImage() {
+      return request.resource.contentType.matches('image/(jpeg|png|webp)')
+             && request.resource.size < 10 * 1024 * 1024; // 10MB cap
+    }
+
+    function isValidVideo() {
+      return request.resource.contentType.matches('video/mp4')
+             && request.resource.size < 100 * 1024 * 1024; // 100MB cap
+    }
+
+    // Product media — path convention: products/{weaverId}/{productId}/{fileId}
+    // Ownership is enforced by path, not by a trusted client-supplied field.
+    match /products/{weaverId}/{productId}/{fileName} {
+      allow read: if true; // published product media is public
+      allow write: if isOwner(weaverId) && (isValidImage() || isValidVideo());
+    }
+
+    // Weaver profile media
+    match /weavers/{weaverId}/{fileName} {
+      allow read: if true;
+      allow write: if isOwner(weaverId) && isValidImage();
+    }
+
+    // Heritage archive media — human-reviewed before the Firestore entry
+    // is published (Rev 3 §8), but the underlying file can be uploaded by
+    // the contributing weaver or a government officer ahead of review.
+    match /heritage/{entryId}/{fileName} {
+      allow read: if true;
+      allow write: if isSignedIn() && (isValidImage() || isValidVideo());
+    }
+
+    // Offline upload queue staging area — client-generated UUID path,
+    // per the Rural-First Experience offline image queue (Rev 3 §4).
+    // Short-lived; a scheduled Cloud Function reconciles/moves these into
+    // their final product path once the associated product write lands.
+    match /uploadQueue/{userId}/{fileName} {
+      allow read, write: if isOwner(userId) && isValidImage();
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
